@@ -1,0 +1,61 @@
+{
+  "name": "Spotify Empire",
+  "description": "Plugins by @Dillu: mini games and Rose-style admin tools",
+  "plugins": [
+    {
+      "id": "mini_games",
+      "name": "Mini Games: .wc & .ttt",
+      "version": "1.0.0",
+      "min_app_version": "1.0.0",
+      "file": "plugins/mini_games/1.0.0/mini_games.plugin",
+      "sha256": "bf0d12c3ffb94da76b183314c6d20099d37f22b04afaf723fe0dddabd2ec5fe9",
+      "size": 56271,
+      "description": "Chat mini-games with inline buttons: .wc 4-digit guessing and .ttt Tic-Tac-Toe, with challenges and score tables",
+      "description_i18n": {
+        "en": "Chat mini-games with inline buttons: .wc 4-digit guessing and .ttt Tic-Tac-Toe, with challenges and score tables",
+        "ru": "Мини-игры в чате с inline-кнопками: .wc угадай 4 цифры и .ttt крестики-нолики, с вызовами и таблицами очков",
+        "uk": "Міні-ігри в чаті з inline-кнопками: .wc вгадай 4 цифри та .ttt хрестики-нулики, з викликами та таблицями очок",
+        "pl": "Minigry w czacie z przyciskami inline: .wc zgadywanie 4 cyfr i .ttt kółko i krzyżyk, z wyzwaniami i tabelami punktów",
+        "es": "Minijuegos en el chat con botones inline: .wc adivina 4 dígitos y .ttt tres en raya, con retos y tablas de puntos",
+        "de": "Chat-Minispiele mit Inline-Buttons: .wc 4-stelliges Zahlenraten und .ttt Tic-Tac-Toe, mit Herausforderungen und Punktetabellen",
+        "fr": "Mini-jeux dans le chat avec boutons inline : .wc devinez 4 chiffres et .ttt morpion, avec défis et tableaux de scores",
+        "pt-BR": "Minijogos no chat com botões inline: .wc adivinhe 4 dígitos e .ttt jogo da velha, com desafios e tabelas de pontos",
+        "tr": "Satır içi düğmeli sohbet mini oyunları: .wc 4 haneli tahmin ve .ttt XOX, meydan okuma ve puan tablolarıyla"
+      },
+      "permissions": [
+        "messages.read",
+        "messages.send",
+        "settings",
+        "hooks"
+      ]
+    },
+    {
+      "id": "empire_admin",
+      "name": "Empire Admin",
+      "version": "1.0.0",
+      "min_app_version": "1.0.0",
+      "file": "plugins/empire_admin/1.0.0/empire_admin.plugin",
+      "sha256": "c736576190764de7a988e34f42625932e7ebf0a09c3c15ce1f8f00b47981e782",
+      "size": 66891,
+      "description": "Rose-style group admin tools: ban, mute, warn, purge, pin, rules, notes, filters, report, chat export/import",
+      "description_i18n": {
+        "en": "Rose-style group admin tools: ban, mute, warn, purge, pin, rules, notes, filters, report, chat export/import",
+        "ru": "Админ-инструменты в стиле Rose: бан, мут, варны, purge, закрепление, правила, заметки, фильтры, жалобы, экспорт/импорт чата",
+        "uk": "Адмін-інструменти в стилі Rose: бан, мут, варни, purge, закріплення, правила, нотатки, фільтри, скарги, експорт/імпорт чату",
+        "pl": "Narzędzia admina w stylu Rose: ban, wyciszenie, ostrzeżenia, purge, przypinanie, regulamin, notatki, filtry, zgłoszenia, eksport/import czatu",
+        "es": "Herramientas de admin estilo Rose: ban, mute, avisos, purge, fijar, reglas, notas, filtros, reportes, exportar/importar chat",
+        "de": "Rose-ähnliche Admin-Tools: Ban, Mute, Verwarnungen, Purge, Anheften, Regeln, Notizen, Filter, Meldungen, Chat-Export/Import",
+        "fr": "Outils d'admin façon Rose : ban, mute, avertissements, purge, épinglage, règles, notes, filtres, signalements, export/import du chat",
+        "pt-BR": "Ferramentas de admin estilo Rose: ban, mute, avisos, purge, fixar, regras, notas, filtros, denúncias, exportar/importar chat",
+        "tr": "Rose tarzı grup yönetici araçları: ban, susturma, uyarı, purge, sabitleme, kurallar, notlar, filtreler, rapor, sohbet dışa/içe aktarma"
+      },
+      "permissions": [
+        "messages.read",
+        "messages.send",
+        "files",
+        "settings",
+        "hooks"
+      ]
+    }
+  ]
+}
