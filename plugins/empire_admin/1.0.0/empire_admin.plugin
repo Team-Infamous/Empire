@@ -1,0 +1,1570 @@
+import json
+import os
+import re
+import tempfile
+import threading
+import time
+from collections import deque
+from concurrent.futures import ThreadPoolExecutor
+from typing import Any, Dict, List, Optional, Tuple
+
+from android_utils import log, run_on_ui_thread
+from base_plugin import BasePlugin, HookResult, HookStrategy
+from client_utils import (
+    get_last_fragment,
+    get_messages_controller,
+    get_user_config,
+    send_document,
+    send_message,
+    send_request,
+)
+from java.lang import Integer
+from java.util import ArrayList
+from org.telegram.messenger import FileLoader, LocaleController, MessagesController, UserConfig
+from org.telegram.tgnet import TLRPC
+from ui.bulletin import BulletinHelper
+from ui.settings import Divider, Header, Input, Selector, Switch, Text
+
+try:
+    from java import jlong
+except Exception:  # pragma: no cover
+    jlong = None
+
+__id__ = "empire_admin"
+__name__ = "Empire Admin"
+__description__ = (
+    "Rose-style group admin tools for your own account.\n"
+    ".ban .tban .unban .kick .mute .tmute .unmute .warn .warnings .purge .del .pin .unpin\n"
+    ".rules .setrules .report .info .id .admins .save .get .filter\n"
+    ".export / .import  (chat settings backup).  .adminhelp for the full list."
+)
+__author__ = "@Dillu"
+__version__ = "1.0.0"
+__min_version__ = "11.12.0"
+__icon__ = "uniposting/54"
+__category__ = ["chats", "tools"]
+
+# ---------------------------------------------------------------------------
+# Constants
+# ---------------------------------------------------------------------------
+
+FORMAT = "empire-admin-export"
+FORMAT_VERSION = 1
+CMD_RE = re.compile(r"^\.([a-z]+)(?:@\w+)?(?:\s+(.*))?$", re.IGNORECASE | re.DOTALL)
+NOTE_RE = re.compile(r"^#([\w-]{1,32})$")
+NOTE_NAME_RE = re.compile(r"^[\w-]{1,32}$")
+DUR_RE = re.compile(r"(\d+)([smhdw])")
+UNITS = {"s": 1, "m": 60, "h": 3600, "d": 86400, "w": 604800}
+MIN_RESTRICT, MAX_RESTRICT = 30, 366 * 86400
+WARN_MODES = ("ban", "kick", "mute", "tban", "tmute")
+MAX_PURGE = 1000
+SEND_FLAGS = ["send_messages", "send_media", "send_stickers", "send_gifs", "send_games", "send_inline",
+              "embed_links", "send_polls", "send_photos", "send_videos", "send_roundvideos",
+              "send_audios", "send_voices", "send_docs", "send_plain"]
+BAN_EXTRA = ["change_info", "invite_users", "pin_messages", "manage_topics"]
+ADMIN_TTL = 600
+FILTER_COOLDOWN = 8
+MAX_IMPORT_BYTES = 2 * 1024 * 1024
+LIMITS = {"rules": 4000, "note": 4000, "notes": 200, "filters": 100, "trigger": 64, "reason": 200,
+          "warn_users": 1000, "warn_each": 20}
+
+ALIASES = {"warns": "warnings", "stopfilter": "stop", "unpinall": "unpin", "d": "del", "help": "adminhelp"}
+COMMANDS = {
+    "ban", "dban", "tban", "unban", "kick", "mute", "tmute", "unmute", "warn", "unwarn", "warnings",
+    "resetwarns", "warnlimit", "warnmode", "purge", "del", "pin", "unpin", "rules", "setrules",
+    "clearrules", "report", "info", "id", "admins", "save", "get", "notes", "clear", "filter", "stop",
+    "filters", "export", "import", "adminhelp",
+} | set(ALIASES)
+
+STR = {
+    "en": {
+        "groups_only": "This command works in groups only.",
+        "no_rights": "You don't have the admin right needed for this.",
+        "no_target": "Reply to a user, or give @username / numeric ID.",
+        "bad_target": "Can't use that target.",
+        "no_reply": "Reply to a message first.",
+        "self_target": "Not on yourself.",
+        "supergroup_only": "Muting needs a supergroup.",
+        "bad_time": "Give a duration like 30m, 2h, 1d, 1w (30 seconds to 366 days).",
+        "err": "Request failed: {e}",
+        "e_admin": "Can't restrict an admin.",
+        "e_rights": "Missing admin rights in this chat.",
+        "e_notmember": "That user isn't in the chat.",
+        "banned": "🔨 {u} was banned. {r}",
+        "tbanned": "⏳ {u} was banned for {d}. {r}",
+        "kicked": "👢 {u} was removed. {r}",
+        "muted": "🔇 {u} was muted. {r}",
+        "tmuted": "⏳ {u} was muted for {d}. {r}",
+        "unbanned": "✅ {u} was unbanned.",
+        "unmuted": "🔊 {u} was unmuted.",
+        "reason": "Reason: {r}",
+        "warned": "⚠️ {u} warned ({n}/{l}). {r}",
+        "warn_limit": "🚨 {u} reached {l} warnings, action: {a}.",
+        "unwarned": "✅ Removed the last warning of {u} ({n} left).",
+        "no_warns": "No warnings.",
+        "warns_reset": "✅ Warnings of {u} cleared.",
+        "warn_hist": "📋 Warnings of {u} ({n}/{l}):",
+        "warn_row": "{i}. {r} · {d}",
+        "warn_noreason": "no reason",
+        "warnlimit_now": "Warn limit: {l}, action: {a}.",
+        "warnlimit_set": "✅ Warn limit set to {l}.",
+        "warnmode_set": "✅ Warn action set to {a}.",
+        "warnmode_bad": "Use: .warnmode ban | kick | mute | tban <time> | tmute <time>",
+        "purged": "🧹 Deleted up to {n} messages.",
+        "purge_ch": "Purge works in supergroups only (message IDs are shared in small groups).",
+        "purge_top": "Can't tell the newest message yet. Send or receive a message first.",
+        "purge_big": "Too many messages (max {m}).",
+        "purge_usage": "Reply to the first message to delete, or use .purge <number>.",
+        "pinned": "📌 Message pinned.",
+        "unpinned": "📍 Unpinned.",
+        "rules_none": "No rules set. Admins can use .setrules <text>.",
+        "rules_head": "📜 Rules:",
+        "rules_set": "✅ Rules saved.",
+        "rules_cleared": "✅ Rules removed.",
+        "rules_need": "Give the rules text or reply to a message that contains it.",
+        "report": "🚨 Report from {r} about {u}.",
+        "report_reason": "Reason: {x}",
+        "report_admins": "Admins: {a}",
+        "admins_head": "👮 Admins:",
+        "admins_fail": "Couldn't load the admin list ({e}).",
+        "info_head": "👤 User info",
+        "info_warns": "Warnings here: {n}/{l}",
+        "id_chat": "Chat ID: {c}",
+        "id_user": "User ID: {u}",
+        "note_saved": "✅ Note #{n} saved.",
+        "note_none": "Note #{n} not found.",
+        "note_removed": "✅ Note #{n} removed.",
+        "notes_head": "🗒 Notes in this chat:",
+        "notes_empty": "No notes. Save one with .save <name> <text>.",
+        "note_usage": "Usage: .save <name> <text> (or reply to a text message). Names: letters, digits, _ and -.",
+        "filter_saved": "✅ Filter \"{t}\" saved.",
+        "filter_removed": "✅ Filter \"{t}\" removed.",
+        "filter_none": "No such filter.",
+        "filters_head": "🔎 Filters in this chat:",
+        "filters_empty": "No filters. Add one with .filter <word> <reply>.",
+        "filter_usage": "Usage: .filter <word> <reply text> (or reply to a text message).",
+        "too_many": "Limit reached.",
+        "exported": "📦 Chat settings export",
+        "export_sent": "📤 Export sent to {w}.",
+        "w_saved": "Saved Messages",
+        "w_here": "this chat",
+        "import_need": "Reply to an exported .json file (or to a message with its text).",
+        "import_notloaded": "Download the file first (tap it), then run .import again.",
+        "import_bad": "That file is not a valid Empire Admin export.",
+        "import_multi": "File holds several chats. Use .import all to restore them by their original IDs.",
+        "import_ok": "✅ Imported: {r} rules, {n} notes, {f} filters, {w} warned users.",
+        "import_ok_all": "✅ Imported {c} chats.",
+        "adminhelp": (
+            "🛡 Empire Admin\n"
+            "Target = reply, @username or ID.\n\n"
+            "Moderation: .ban .dban .tban <time> .unban .kick .mute .tmute <time> .unmute\n"
+            "Warns: .warn [reason] .unwarn .warnings .resetwarns .warnlimit <n> .warnmode <mode>\n"
+            "Messages: .purge (reply or number) .del .pin [loud] .unpin [all]\n"
+            "Group: .rules .setrules <text> .clearrules .report [reason] .admins\n"
+            "Info: .info .id\n"
+            "Notes: .save <name> <text> .get <name> (or #name) .notes .clear <name>\n"
+            "Filters: .filter <word> <reply> .stop <word> .filters\n"
+            "Backup: .export [all] [here] .import [all] [replace]  (reply to the file)"
+        ),
+        "s_head": "Empire Admin",
+        "s_lang": "Message language",
+        "s_lang_items": ["Auto", "English", "Русский"],
+        "s_feedback": "Result messages",
+        "s_feedback_items": ["Post in chat", "Toast only"],
+        "s_auto": "Answer filters and #notes for others",
+        "s_auto_sub": "Replies are sent from your account in chats where you created them.",
+        "s_limit": "Default warn limit",
+        "s_limit_sub": "1 to 20, used for new chats",
+        "s_reset": "Erase all Empire Admin data",
+        "s_done": "Data erased",
+        "s_foot": "You need the matching admin rights in the chat. Telegram enforces them, this plugin only sends the requests.",
+    },
+    "ru": {
+        "groups_only": "Команда работает только в группах.",
+        "no_rights": "У вас нет нужного права администратора.",
+        "no_target": "Ответьте на сообщение пользователя или укажите @username / ID.",
+        "bad_target": "Эту цель использовать нельзя.",
+        "no_reply": "Сначала ответьте на сообщение.",
+        "self_target": "Нельзя применять к себе.",
+        "supergroup_only": "Для мута нужна супергруппа.",
+        "bad_time": "Укажите время: 30m, 2h, 1d, 1w (от 30 секунд до 366 дней).",
+        "err": "Запрос не удался: {e}",
+        "e_admin": "Нельзя ограничить администратора.",
+        "e_rights": "Нет прав администратора в этом чате.",
+        "e_notmember": "Пользователя нет в чате.",
+        "banned": "🔨 {u} забанен. {r}",
+        "tbanned": "⏳ {u} забанен на {d}. {r}",
+        "kicked": "👢 {u} исключён. {r}",
+        "muted": "🔇 {u} в муте. {r}",
+        "tmuted": "⏳ {u} в муте на {d}. {r}",
+        "unbanned": "✅ {u} разбанен.",
+        "unmuted": "🔊 {u} размучен.",
+        "reason": "Причина: {r}",
+        "warned": "⚠️ {u} предупреждён ({n}/{l}). {r}",
+        "warn_limit": "🚨 {u} набрал {l} предупреждений, действие: {a}.",
+        "unwarned": "✅ Последнее предупреждение {u} снято (осталось {n}).",
+        "no_warns": "Предупреждений нет.",
+        "warns_reset": "✅ Предупреждения {u} сброшены.",
+        "warn_hist": "📋 Предупреждения {u} ({n}/{l}):",
+        "warn_row": "{i}. {r} · {d}",
+        "warn_noreason": "без причины",
+        "warnlimit_now": "Лимит варнов: {l}, действие: {a}.",
+        "warnlimit_set": "✅ Лимит варнов: {l}.",
+        "warnmode_set": "✅ Действие при лимите: {a}.",
+        "warnmode_bad": "Используйте: .warnmode ban | kick | mute | tban <время> | tmute <время>",
+        "purged": "🧹 Удалено сообщений (до): {n}.",
+        "purge_ch": "Purge работает только в супергруппах (в малых группах ID сообщений общие).",
+        "purge_top": "Пока не известно последнее сообщение. Отправьте или получите сообщение.",
+        "purge_big": "Слишком много сообщений (максимум {m}).",
+        "purge_usage": "Ответьте на первое сообщение для удаления или .purge <число>.",
+        "pinned": "📌 Сообщение закреплено.",
+        "unpinned": "📍 Откреплено.",
+        "rules_none": "Правил нет. Админ может задать: .setrules <текст>.",
+        "rules_head": "📜 Правила:",
+        "rules_set": "✅ Правила сохранены.",
+        "rules_cleared": "✅ Правила удалены.",
+        "rules_need": "Укажите текст правил или ответьте на сообщение с ним.",
+        "report": "🚨 Жалоба от {r} на {u}.",
+        "report_reason": "Причина: {x}",
+        "report_admins": "Админы: {a}",
+        "admins_head": "👮 Администраторы:",
+        "admins_fail": "Не удалось получить список админов ({e}).",
+        "info_head": "👤 Информация",
+        "info_warns": "Предупреждений здесь: {n}/{l}",
+        "id_chat": "ID чата: {c}",
+        "id_user": "ID пользователя: {u}",
+        "note_saved": "✅ Заметка #{n} сохранена.",
+        "note_none": "Заметка #{n} не найдена.",
+        "note_removed": "✅ Заметка #{n} удалена.",
+        "notes_head": "🗒 Заметки чата:",
+        "notes_empty": "Заметок нет. Сохраните: .save <имя> <текст>.",
+        "note_usage": "Использование: .save <имя> <текст> (или ответ на текст). Имя: буквы, цифры, _ и -.",
+        "filter_saved": "✅ Фильтр «{t}» сохранён.",
+        "filter_removed": "✅ Фильтр «{t}» удалён.",
+        "filter_none": "Такого фильтра нет.",
+        "filters_head": "🔎 Фильтры чата:",
+        "filters_empty": "Фильтров нет. Добавьте: .filter <слово> <ответ>.",
+        "filter_usage": "Использование: .filter <слово> <ответ> (или ответ на текст).",
+        "too_many": "Достигнут лимит.",
+        "exported": "📦 Экспорт настроек чата",
+        "export_sent": "📤 Экспорт отправлен: {w}.",
+        "w_saved": "Избранное",
+        "w_here": "этот чат",
+        "import_need": "Ответьте на экспортированный .json файл (или на сообщение с его текстом).",
+        "import_notloaded": "Сначала скачайте файл (нажмите на него), затем снова .import.",
+        "import_bad": "Это не корректный экспорт Empire Admin.",
+        "import_multi": "В файле несколько чатов. Используйте .import all для восстановления по исходным ID.",
+        "import_ok": "✅ Импортировано: правил {r}, заметок {n}, фильтров {f}, пользователей с варнами {w}.",
+        "import_ok_all": "✅ Импортировано чатов: {c}.",
+        "adminhelp": (
+            "🛡 Empire Admin\n"
+            "Цель = ответ, @username или ID.\n\n"
+            "Модерация: .ban .dban .tban <время> .unban .kick .mute .tmute <время> .unmute\n"
+            "Варны: .warn [причина] .unwarn .warnings .resetwarns .warnlimit <n> .warnmode <режим>\n"
+            "Сообщения: .purge (ответ или число) .del .pin [loud] .unpin [all]\n"
+            "Группа: .rules .setrules <текст> .clearrules .report [причина] .admins\n"
+            "Инфо: .info .id\n"
+            "Заметки: .save <имя> <текст> .get <имя> (или #имя) .notes .clear <имя>\n"
+            "Фильтры: .filter <слово> <ответ> .stop <слово> .filters\n"
+            "Бэкап: .export [all] [here] .import [all] [replace]  (ответом на файл)"
+        ),
+        "s_head": "Empire Admin",
+        "s_lang": "Язык сообщений",
+        "s_lang_items": ["Авто", "English", "Русский"],
+        "s_feedback": "Сообщения о результате",
+        "s_feedback_items": ["Писать в чат", "Только уведомление"],
+        "s_auto": "Отвечать на фильтры и #заметки других",
+        "s_auto_sub": "Ответы уходят с вашего аккаунта в чатах, где вы их создали.",
+        "s_limit": "Лимит варнов по умолчанию",
+        "s_limit_sub": "От 1 до 20, для новых чатов",
+        "s_reset": "Стереть все данные Empire Admin",
+        "s_done": "Данные стёрты",
+        "s_foot": "Нужны соответствующие права администратора. Их проверяет Telegram, плагин лишь отправляет запросы.",
+    },
+}
+
+
+# ---------------------------------------------------------------------------
+# Pure helpers (no Telegram / Android calls)
+# ---------------------------------------------------------------------------
+
+def parse_duration(token: str) -> Optional[int]:
+    """'1h30m' -> 5400. None when malformed or outside Telegram's 30s..366d window."""
+    token = (token or "").strip().lower()
+    if not re.fullmatch(r"(?:\d+[smhdw])+", token):
+        return None
+    total = sum(int(n) * UNITS[u] for n, u in DUR_RE.findall(token))
+    return total if MIN_RESTRICT <= total <= MAX_RESTRICT else None
+
+
+def fmt_duration(seconds: int) -> str:
+    parts = []
+    for unit, size in (("w", 604800), ("d", 86400), ("h", 3600), ("m", 60), ("s", 1)):
+        if seconds >= size:
+            parts.append("%d%s" % (seconds // size, unit))
+            seconds %= size
+    return " ".join(parts) or "0s"
+
+
+def split_first(text: str) -> Tuple[str, str]:
+    text = (text or "").strip()
+    if not text:
+        return "", ""
+    parts = text.split(None, 1)
+    return parts[0], (parts[1].strip() if len(parts) > 1 else "")
+
+
+def _clip(value: Any, n: int) -> str:
+    return value[:n] if isinstance(value, str) else ""
+
+
+def sanitize_chat(raw: Any) -> Optional[dict]:
+    """Validate one chat block of an import file. Returns a clean dict or None."""
+    if not isinstance(raw, dict):
+        return None
+    out = {"rules": _clip(raw.get("rules", ""), LIMITS["rules"]), "notes": {}, "filters": {}, "warns": {}}
+    w = raw.get("warn") if isinstance(raw.get("warn"), dict) else {}
+    try:
+        limit = int(w.get("limit", 3))
+    except Exception:
+        limit = 3
+    mode = w.get("mode") if w.get("mode") in WARN_MODES else "ban"
+    try:
+        dur = int(w.get("dur", 86400))
+    except Exception:
+        dur = 86400
+    out["warn"] = {"limit": max(1, min(20, limit)), "mode": mode,
+                   "dur": max(MIN_RESTRICT, min(MAX_RESTRICT, dur))}
+    notes = raw.get("notes") if isinstance(raw.get("notes"), dict) else {}
+    for name, text in list(notes.items())[:LIMITS["notes"]]:
+        if isinstance(name, str) and NOTE_NAME_RE.match(name) and isinstance(text, str) and text.strip():
+            out["notes"][name.lower()] = text[:LIMITS["note"]]
+    filters = raw.get("filters") if isinstance(raw.get("filters"), dict) else {}
+    for trig, text in list(filters.items())[:LIMITS["filters"]]:
+        if isinstance(trig, str) and trig.strip() and len(trig) <= LIMITS["trigger"] \
+                and isinstance(text, str) and text.strip():
+            out["filters"][trig.lower()] = text[:LIMITS["note"]]
+    warns = raw.get("warns") if isinstance(raw.get("warns"), dict) else {}
+    for uid, rows in list(warns.items())[:LIMITS["warn_users"]]:
+        if not (isinstance(uid, str) and uid.isdigit() and isinstance(rows, list)):
+            continue
+        clean = []
+        for row in rows[:LIMITS["warn_each"]]:
+            if isinstance(row, dict):
+                try:
+                    clean.append({"r": _clip(row.get("r", ""), LIMITS["reason"]),
+                                  "t": int(row.get("t", 0)), "by": int(row.get("by", 0))})
+                except Exception:
+                    continue
+        if clean:
+            out["warns"][uid] = clean
+    return out
+
+
+class Store:
+    """All per-chat data in one JSON document inside the plugin settings."""
+
+    def __init__(self, plugin):
+        self.plugin = plugin
+        self.lock = threading.RLock()
+        self.db = self._load()
+
+    def _load(self) -> dict:
+        try:
+            db = json.loads(self.plugin.get_setting("db", "{}"))
+            if isinstance(db, dict) and isinstance(db.get("chats"), dict):
+                return db
+        except Exception:
+            pass
+        return {"chats": {}}
+
+    def save(self):
+        self.plugin.set_setting("db", json.dumps(self.db, ensure_ascii=False))
+
+    def default_limit(self) -> int:
+        try:
+            return max(1, min(20, int(str(self.plugin.get_setting("default_warn_limit", "3")).strip())))
+        except Exception:
+            return 3
+
+    def peek(self, dialog: int) -> Optional[dict]:
+        return self.db["chats"].get(str(dialog))
+
+    def chat(self, dialog: int) -> dict:
+        c = self.db["chats"].setdefault(str(dialog), {})
+        c.setdefault("rules", "")
+        c.setdefault("warn", {"limit": self.default_limit(), "mode": "ban", "dur": 86400})
+        c.setdefault("warns", {})
+        c.setdefault("notes", {})
+        c.setdefault("filters", {})
+        return c
+
+    def reset(self):
+        self.db = {"chats": {}}
+        self.save()
+
+
+class Ctx:
+    """Everything a command handler needs, captured on the hook thread."""
+
+    def __init__(self, account, dialog, me, arg, reply, reply_uid, reply_id, cmd):
+        self.account, self.dialog, self.me = account, dialog, me
+        self.arg, self.reply, self.reply_uid, self.reply_id, self.cmd = arg, reply, reply_uid, reply_id, cmd
+
+
+def _to_int(value) -> int:
+    try:
+        return int(str(value))
+    except Exception:
+        return 0
+
+
+# ---------------------------------------------------------------------------
+# Plugin
+# ---------------------------------------------------------------------------
+
+class EmpireAdminPlugin(BasePlugin):
+
+    def on_plugin_load(self):
+        self._exec = ThreadPoolExecutor(max_workers=1)
+        self._store = Store(self)
+        self._names: Dict[int, str] = {}
+        self._usernames: Dict[int, str] = {}
+        self._admins: Dict[Tuple[int, int], Tuple[float, Dict[int, dict]]] = {}
+        self._top: Dict[Tuple[int, int], int] = {}
+        self._cool: Dict[Tuple[int, str], float] = {}
+        self._seen = deque(maxlen=400)
+        self._seen_set = set()
+        self._auto_lang = None
+        self.add_on_send_message_hook()
+        for name in ("TL_updateNewMessage", "TL_updateNewChannelMessage",
+                     "TL_updateShortMessage", "TL_updateShortChatMessage"):
+            try:
+                self.add_hook(name)
+            except Exception as e:
+                log("[EmpireAdmin] add_hook(%s): %s" % (name, e))
+        log("[EmpireAdmin] loaded")
+
+    def on_plugin_unload(self):
+        try:
+            self._exec.shutdown(wait=False)
+        except Exception:
+            pass
+
+    # ----- settings --------------------------------------------------------
+
+    def create_settings(self):
+        t = lambda k: STR[self._lang()][k]
+        return [
+            Header(text=t("s_head")),
+            Selector(key="lang", text=t("s_lang"), default=0, items=t("s_lang_items"), icon="msg_language"),
+            Selector(key="feedback", text=t("s_feedback"), default=0, items=t("s_feedback_items"), icon="msg_list"),
+            Switch(key="autoreply", text=t("s_auto"), default=True, subtext=t("s_auto_sub"), icon="msg_reply"),
+            Input(key="default_warn_limit", text=t("s_limit"), default="3", subtext=t("s_limit_sub"), icon="msg_warning"),
+            Divider(),
+            Text(text=t("s_reset"), on_click=lambda _: self._reset_all(), icon="msg_clear"),
+            Divider(text=t("s_foot")),
+        ]
+
+    def _reset_all(self):
+        try:
+            self._store.reset()
+            self._toast(self.T("s_done"))
+        except Exception as e:
+            log("[EmpireAdmin] reset: %s" % e)
+
+    # ----- helpers ---------------------------------------------------------
+
+    def _lang(self) -> str:
+        try:
+            choice = int(self.get_setting("lang", 0))
+        except Exception:
+            choice = 0
+        if choice == 1:
+            return "en"
+        if choice == 2:
+            return "ru"
+        if self._auto_lang is None:
+            try:
+                code = str(LocaleController.getInstance().getCurrentLocaleInfo().getLangCode())
+            except Exception:
+                code = "en"
+            self._auto_lang = "ru" if code.lower().startswith(("ru", "uk", "be")) else "en"
+        return self._auto_lang
+
+    def T(self, key: str, **kw) -> str:
+        text = STR[self._lang()].get(key) or STR["en"].get(key, key)
+        return text.format(**kw) if kw else text
+
+    def _toast(self, text: str):
+        try:
+            run_on_ui_thread(lambda: BulletinHelper.show_info(text))
+        except Exception as e:
+            log("[EmpireAdmin] toast: %s" % e)
+
+    def _submit(self, fn, *args):
+        def run():
+            try:
+                fn(*args)
+            except Exception as e:
+                import traceback
+                log("[EmpireAdmin] task error: %s\n%s" % (e, traceback.format_exc()))
+                self._toast(self.T("err", e=str(e)[:120]))
+        try:
+            self._exec.submit(run)
+        except Exception as e:
+            log("[EmpireAdmin] submit: %s" % e)
+
+    def _later(self, seconds: float, fn, *args):
+        timer = threading.Timer(seconds, lambda: self._submit(fn, *args))
+        timer.daemon = True
+        timer.start()
+
+    def _me(self, account: int) -> int:
+        try:
+            return int(UserConfig.getInstance(account).getClientUserId())
+        except Exception:
+            try:
+                return int(get_user_config().getClientUserId())
+            except Exception:
+                return 0
+
+    def _mc(self, account: int):
+        try:
+            return MessagesController.getInstance(account)
+        except Exception:
+            return get_messages_controller()
+
+    def _load_user(self, account: int, uid: int):
+        try:
+            user = self._mc(account).getUser(uid)
+        except Exception:
+            user = None
+        if user is None:
+            return None
+        first = str(getattr(user, "first_name", "") or "")
+        last = str(getattr(user, "last_name", "") or "")
+        full = (first + " " + last).strip()
+        uname = str(getattr(user, "username", "") or "")
+        if full or uname:
+            self._names[uid] = full or uname
+        if uname:
+            self._usernames[uid] = uname
+        return user
+
+    def _name(self, account: int, uid: int) -> str:
+        if uid not in self._names:
+            self._load_user(account, uid)
+        return self._names.get(uid) or ("User %d" % uid)
+
+    def _mention(self, account: int, uid: int) -> str:
+        self._name(account, uid)
+        uname = self._usernames.get(uid)
+        return "@" + uname if uname else self._name(account, uid)
+
+    def _say(self, ctx: Ctx, text: str, reply=None, force: bool = False):
+        """Result message: posted in the chat (or only toasted if the setting says so)."""
+        try:
+            toast_only = int(self.get_setting("feedback", 0)) == 1
+        except Exception:
+            toast_only = False
+        if toast_only and not force:
+            self._toast(text.split("\n")[0])
+            return
+        self._post(ctx.account, ctx.dialog, text, reply)
+
+    def _post(self, account: int, dialog: int, text: str, reply=None):
+        payload = {"peer": dialog, "message": text[:4000]}
+        try:
+            if account != UserConfig.selectedAccount:
+                payload["account"] = account
+        except Exception:
+            pass
+        if reply is not None:
+            try:
+                send_message(dict(payload, replyToMsg=reply))
+                return
+            except Exception as e:
+                log("[EmpireAdmin] reply send failed (%s), sending plain" % e)
+        send_message(payload)
+
+    def _err(self, text: str):
+        self._toast(text)
+
+    # ----- permission / target helpers --------------------------------------
+
+    def _chat_obj(self, ctx: Ctx):
+        try:
+            return self._mc(ctx.account).getChat(-ctx.dialog) if ctx.dialog < 0 else None
+        except Exception:
+            return None
+
+    @staticmethod
+    def _is_channel(chat) -> bool:
+        return bool(getattr(chat, "megagroup", False) or getattr(chat, "broadcast", False))
+
+    def _need(self, ctx: Ctx, right: Optional[str] = None, group: bool = True) -> bool:
+        if group and ctx.dialog >= 0:
+            self._err(self.T("groups_only"))
+            return False
+        if right:
+            chat = self._chat_obj(ctx)
+            if chat is not None:
+                creator = bool(getattr(chat, "creator", False))
+                rights = getattr(chat, "admin_rights", None)
+                if not (creator or (rights is not None and bool(getattr(rights, right, False)))):
+                    self._err(self.T("no_rights"))
+                    return False
+        return True
+
+    def _resolve(self, ctx: Ctx, arg: str) -> Tuple[int, str]:
+        """(user id, remaining text). Reply wins; otherwise the first word is @username or a numeric ID."""
+        if ctx.reply_uid:
+            return ctx.reply_uid, arg.strip()
+        tok, rest = split_first(arg)
+        if not tok:
+            return 0, ""
+        if tok.isdigit():
+            return int(tok), rest
+        if tok.startswith("@") and len(tok) > 1:
+            try:
+                obj = self._mc(ctx.account).getUserOrChat(tok[1:])
+                if obj is not None and hasattr(obj, "first_name"):
+                    return int(obj.id), rest
+            except Exception as e:
+                log("[EmpireAdmin] resolve %s: %s" % (tok, e))
+        return 0, arg.strip()
+
+    def _target(self, ctx: Ctx, arg: str, allow_self: bool = False) -> Tuple[int, str]:
+        uid, rest = self._resolve(ctx, arg)
+        if uid <= 0:
+            self._err(self.T("no_target"))
+            return 0, ""
+        if uid == ctx.me and not allow_self:
+            self._err(self.T("self_target"))
+            return 0, ""
+        return uid, rest
+
+    def _reason(self, text: str) -> str:
+        return self.T("reason", r=text) if text else ""
+
+    # ----- outgoing hook -----------------------------------------------------
+
+    def on_send_message_hook(self, account, params):
+        try:
+            raw = getattr(params, "message", None)
+            if not isinstance(raw, str):
+                return HookResult()
+            text = raw.strip()
+            peer = _to_int(getattr(params, "peer", 0))
+            if not peer:
+                return HookResult()
+            m = CMD_RE.match(text)
+            if m and m.group(1).lower() in COMMANDS:
+                cmd = ALIASES.get(m.group(1).lower(), m.group(1).lower())
+                reply, reply_uid, reply_id = self._reply_info(params)
+                ctx = Ctx(account, peer, self._me(account), (m.group(2) or "").strip(),
+                          reply, reply_uid, reply_id, cmd)
+                self._submit(self._run, ctx)
+                return HookResult(strategy=HookStrategy.CANCEL)
+            n = NOTE_RE.match(text)
+            if n:
+                c = self._store.peek(peer)
+                name = n.group(1).lower()
+                if c and name in c["notes"]:
+                    self._submit(self._post, account, peer, c["notes"][name])
+                    return HookResult(strategy=HookStrategy.CANCEL)
+        except Exception as e:
+            import traceback
+            log("[EmpireAdmin] send hook: %s\n%s" % (e, traceback.format_exc()))
+        return HookResult()
+
+    def _reply_info(self, params):
+        reply = getattr(params, "replyToMsg", None)
+        if reply is None or isinstance(reply, (int, str)):
+            return None, 0, 0
+        top = getattr(params, "replyToTopMsg", None)
+        try:
+            if top is not None and int(reply.getId()) == int(top.getId()):
+                return None, 0, 0           # forum topic root, not a real reply
+        except Exception:
+            pass
+        uid = 0
+        try:
+            uid = int(reply.getSenderId())
+        except Exception:
+            try:
+                uid = int(reply.messageOwner.from_id.user_id)
+            except Exception:
+                uid = 0
+        try:
+            rid = int(reply.getId())
+        except Exception:
+            rid = 0
+        return reply, (uid if uid > 0 else 0), rid
+
+    def _run(self, ctx: Ctx):
+        handler = getattr(self, "_cmd_" + ctx.cmd, None)
+        if handler is None:
+            return
+        handler(ctx, ctx.arg)
+
+    # ----- moderation primitives ---------------------------------------------
+
+    def _rights(self, kind: str, until: int):
+        r = TLRPC.TL_chatBannedRights()
+        if kind == "free":
+            r.until_date = 0
+            return r
+        r.until_date = int(until)
+        flags = list(SEND_FLAGS)
+        if kind == "ban":
+            flags += BAN_EXTRA + ["view_messages"]
+        for name in flags:
+            try:
+                setattr(r, name, True)
+            except Exception:
+                pass
+        return r
+
+    def _explain(self, text: str) -> str:
+        t = (text or "").upper()
+        if "USER_ADMIN_INVALID" in t or "CHAT_ADMIN_INVALID" in t:
+            return self.T("e_admin")
+        if "ADMIN_REQUIRED" in t or "RIGHT_FORBIDDEN" in t or "CHAT_WRITE_FORBIDDEN" in t:
+            return self.T("e_rights")
+        if "NOT_PARTICIPANT" in t:
+            return self.T("e_notmember")
+        return self.T("err", e=text)
+
+    def _restrict(self, ctx: Ctx, uid: int, kind: str, until: int, done):
+        """kind: ban | mute | free. done(ok: bool, message: str)."""
+        mc = self._mc(ctx.account)
+        chat_id = -ctx.dialog
+        chat = self._chat_obj(ctx)
+        if chat is not None and not self._is_channel(chat):
+            if kind == "ban":
+                self._basic_kick(ctx, uid, done)
+            elif kind == "free":
+                done(True, "")
+            else:
+                done(False, self.T("supergroup_only"))
+            return
+        rights = self._rights(kind, until)
+        try:
+            req = TLRPC.TL_channels_editBanned()
+            try:
+                req.channel = mc.getInputChannel(chat_id)
+            except Exception:
+                req.channel = MessagesController.getInputChannel(chat)
+            req.participant = mc.getInputPeer(uid)
+            req.banned_rights = rights
+
+            def on_reply(res, err):
+                if err is not None:
+                    done(False, self._explain(str(getattr(err, "text", err))))
+                    return
+                try:
+                    mc.processUpdates(res, False)
+                except Exception:
+                    pass
+                done(True, "")
+
+            send_request(req, on_reply, account=ctx.account)
+        except Exception as e:
+            log("[EmpireAdmin] raw editBanned failed (%s), using helper" % e)
+            self._restrict_helper(ctx, uid, rights, done)
+
+    def _restrict_helper(self, ctx: Ctx, uid: int, rights, done):
+        """Fallback: the client's own helper (fire-and-forget, so success is unconfirmed)."""
+        def work():
+            try:
+                mc = self._mc(ctx.account)
+                mc.setParticipantBannedRole(-ctx.dialog, mc.getUser(uid), None, rights, True, get_last_fragment())
+                done(True, "")
+            except Exception as e:
+                done(False, self.T("err", e=str(e)[:120]))
+        run_on_ui_thread(work)
+
+    def _basic_kick(self, ctx: Ctx, uid: int, done):
+        def work():
+            try:
+                mc = self._mc(ctx.account)
+                mc.deleteParticipantFromChat(-ctx.dialog, mc.getInputPeer(uid))
+                done(True, "")
+            except Exception as e:
+                done(False, self.T("err", e=str(e)[:120]))
+        run_on_ui_thread(work)
+
+    def _kick(self, ctx: Ctx, uid: int, done):
+        chat = self._chat_obj(ctx)
+        if chat is not None and not self._is_channel(chat):
+            self._basic_kick(ctx, uid, done)
+            return
+
+        def after_ban(ok, msg):
+            if not ok:
+                done(False, msg)
+                return
+            # a kick is a ban that is lifted right away, so the user can rejoin
+            self._later(1.5, self._restrict, ctx, uid, "free", 0, lambda ok2, m2: done(ok2, m2))
+        self._restrict(ctx, uid, "ban", 0, after_ban)
+
+    def _delete_ids(self, account: int, dialog: int, ids: List[int]):
+        def work():
+            for i in range(0, len(ids), 100):
+                lst = ArrayList()
+                for x in ids[i:i + 100]:
+                    lst.add(Integer(x))
+                self._mc(account).deleteMessages(lst, None, None, dialog, 0, True, 0)
+        run_on_ui_thread(work)
+
+    # ----- ban / mute family ---------------------------------------------------
+
+    def _simple_restrict(self, ctx: Ctx, arg: str, kind: str, done_key: str, timed: bool,
+                         delete_reply: bool = False):
+        if not self._need(ctx, "ban_users"):
+            return
+        uid, rest = self._target(ctx, arg)
+        if not uid:
+            return
+        seconds = 0
+        if timed:
+            tok, rest = split_first(rest)
+            seconds = parse_duration(tok) or 0
+            if not seconds:
+                self._err(self.T("bad_time"))
+                return
+        until = int(time.time()) + seconds if seconds else 0
+        who = self._mention(ctx.account, uid)
+        reason = self._reason(rest)
+
+        def done(ok, msg):
+            if not ok:
+                self._err(msg)
+                return
+            self._say(ctx, self.T(done_key, u=who, r=reason, d=fmt_duration(seconds)).strip())
+        self._restrict(ctx, uid, kind, until, done)
+        if delete_reply and ctx.reply_id:
+            self._delete_ids(ctx.account, ctx.dialog, [ctx.reply_id])
+
+    def _cmd_ban(self, ctx, arg):
+        self._simple_restrict(ctx, arg, "ban", "banned", False)
+
+    def _cmd_dban(self, ctx, arg):
+        self._simple_restrict(ctx, arg, "ban", "banned", False, delete_reply=True)
+
+    def _cmd_tban(self, ctx, arg):
+        self._simple_restrict(ctx, arg, "ban", "tbanned", True)
+
+    def _cmd_mute(self, ctx, arg):
+        self._simple_restrict(ctx, arg, "mute", "muted", False)
+
+    def _cmd_tmute(self, ctx, arg):
+        self._simple_restrict(ctx, arg, "mute", "tmuted", True)
+
+    def _cmd_unban(self, ctx, arg):
+        self._simple_restrict(ctx, arg, "free", "unbanned", False)
+
+    def _cmd_unmute(self, ctx, arg):
+        self._simple_restrict(ctx, arg, "free", "unmuted", False)
+
+    def _cmd_kick(self, ctx, arg):
+        if not self._need(ctx, "ban_users"):
+            return
+        uid, rest = self._target(ctx, arg)
+        if not uid:
+            return
+        who, reason = self._mention(ctx.account, uid), self._reason(rest)
+
+        def done(ok, msg):
+            if not ok:
+                self._err(msg)
+            else:
+                self._say(ctx, self.T("kicked", u=who, r=reason).strip())
+        self._kick(ctx, uid, done)
+
+    # ----- warnings -------------------------------------------------------------
+
+    def _action_text(self, w: dict) -> str:
+        if w["mode"] in ("tban", "tmute"):
+            return "%s %s" % (w["mode"], fmt_duration(w.get("dur", 86400)))
+        return w["mode"]
+
+    def _cmd_warn(self, ctx, arg):
+        if not self._need(ctx, "ban_users"):
+            return
+        uid, reason = self._target(ctx, arg)
+        if not uid:
+            return
+        reason = reason[:LIMITS["reason"]]
+        who = self._mention(ctx.account, uid)
+        with self._store.lock:
+            c = self._store.chat(ctx.dialog)
+            rows = c["warns"].setdefault(str(uid), [])
+            rows.append({"r": reason, "t": int(time.time()), "by": ctx.me})
+            del rows[:-LIMITS["warn_each"]]
+            n, w = len(rows), dict(c["warn"])
+            self._store.save()
+        if n < w["limit"]:
+            self._say(ctx, self.T("warned", u=who, n=n, l=w["limit"], r=self._reason(reason)).strip(),
+                      reply=ctx.reply)
+            return
+        action = self._action_text(w)
+        self._say(ctx, self.T("warn_limit", u=who, l=w["limit"], a=action))
+        seconds = int(w.get("dur", 86400))
+
+        def done(ok, msg):
+            if not ok:
+                self._err(msg)
+                return
+            with self._store.lock:
+                self._store.chat(ctx.dialog)["warns"].pop(str(uid), None)
+                self._store.save()
+        mode = w["mode"]
+        if mode == "kick":
+            self._kick(ctx, uid, done)
+        elif mode == "ban":
+            self._restrict(ctx, uid, "ban", 0, done)
+        elif mode == "mute":
+            self._restrict(ctx, uid, "mute", 0, done)
+        elif mode == "tban":
+            self._restrict(ctx, uid, "ban", int(time.time()) + seconds, done)
+        else:
+            self._restrict(ctx, uid, "mute", int(time.time()) + seconds, done)
+
+    def _cmd_unwarn(self, ctx, arg):
+        if not self._need(ctx, "ban_users"):
+            return
+        uid, _ = self._target(ctx, arg, allow_self=True)
+        if not uid:
+            return
+        with self._store.lock:
+            c = self._store.chat(ctx.dialog)
+            rows = c["warns"].get(str(uid), [])
+            if not rows:
+                self._err(self.T("no_warns"))
+                return
+            rows.pop()
+            if not rows:
+                c["warns"].pop(str(uid), None)
+            left = len(rows)
+            self._store.save()
+        self._say(ctx, self.T("unwarned", u=self._mention(ctx.account, uid), n=left))
+
+    def _cmd_resetwarns(self, ctx, arg):
+        if not self._need(ctx, "ban_users"):
+            return
+        uid, _ = self._target(ctx, arg, allow_self=True)
+        if not uid:
+            return
+        with self._store.lock:
+            self._store.chat(ctx.dialog)["warns"].pop(str(uid), None)
+            self._store.save()
+        self._say(ctx, self.T("warns_reset", u=self._mention(ctx.account, uid)))
+
+    def _cmd_warnings(self, ctx, arg):
+        if not self._need(ctx):
+            return
+        uid, _ = self._resolve(ctx, arg)
+        uid = uid or ctx.me
+        with self._store.lock:
+            c = self._store.chat(ctx.dialog)
+            rows = list(c["warns"].get(str(uid), []))
+            limit = c["warn"]["limit"]
+        who = self._mention(ctx.account, uid)
+        if not rows:
+            self._say(ctx, "%s: %s" % (who, self.T("no_warns")), force=True)
+            return
+        lines = [self.T("warn_hist", u=who, n=len(rows), l=limit)]
+        for i, row in enumerate(rows, 1):
+            lines.append(self.T("warn_row", i=i, r=row.get("r") or self.T("warn_noreason"),
+                                d=time.strftime("%Y-%m-%d %H:%M", time.localtime(row.get("t", 0)))))
+        self._say(ctx, "\n".join(lines), force=True)
+
+    def _cmd_warnlimit(self, ctx, arg):
+        if not self._need(ctx):
+            return
+        with self._store.lock:
+            w = self._store.chat(ctx.dialog)["warn"]
+            if not arg.strip():
+                self._say(ctx, self.T("warnlimit_now", l=w["limit"], a=self._action_text(w)), force=True)
+                return
+        if not self._need(ctx, "ban_users"):
+            return
+        try:
+            n = int(arg.split()[0])
+            assert 1 <= n <= 20
+        except Exception:
+            self._err("1-20")
+            return
+        with self._store.lock:
+            self._store.chat(ctx.dialog)["warn"]["limit"] = n
+            self._store.save()
+        self._say(ctx, self.T("warnlimit_set", l=n))
+
+    def _cmd_warnmode(self, ctx, arg):
+        if not self._need(ctx, "ban_users"):
+            return
+        mode, rest = split_first(arg.lower())
+        if mode not in WARN_MODES:
+            self._err(self.T("warnmode_bad"))
+            return
+        dur = 86400
+        if mode in ("tban", "tmute"):
+            dur = parse_duration(rest) or 0
+            if not dur:
+                self._err(self.T("bad_time"))
+                return
+        with self._store.lock:
+            w = self._store.chat(ctx.dialog)["warn"]
+            w["mode"], w["dur"] = mode, dur
+            self._store.save()
+            text = self._action_text(w)
+        self._say(ctx, self.T("warnmode_set", a=text))
+
+    # ----- purge / del / pin ---------------------------------------------------
+
+    def _top_id(self, ctx: Ctx) -> int:
+        top = self._top.get((ctx.account, ctx.dialog), 0)
+        try:
+            key = jlong(ctx.dialog) if jlong is not None else ctx.dialog
+            dialog = self._mc(ctx.account).dialogs_dict.get(key)
+            if dialog is not None:
+                top = max(top, _to_int(getattr(dialog, "top_message", 0)))
+        except Exception:
+            pass
+        return top
+
+    def _cmd_purge(self, ctx, arg):
+        if not self._need(ctx, "delete_messages"):
+            return
+        chat = self._chat_obj(ctx)
+        if chat is None or not self._is_channel(chat):
+            self._err(self.T("purge_ch"))      # ids are per-chat only in supergroups
+            return
+        top = self._top_id(ctx)
+        if top <= 0:
+            self._err(self.T("purge_top"))
+            return
+        if ctx.reply_id:
+            first = ctx.reply_id
+        else:
+            try:
+                n = int(arg.split()[0])
+                assert n >= 1
+            except Exception:
+                self._err(self.T("purge_usage"))
+                return
+            if n > MAX_PURGE:
+                self._err(self.T("purge_big", m=MAX_PURGE))
+                return
+            first = top - n + 1
+        first = max(1, first)
+        count = top - first + 1
+        if count > MAX_PURGE:
+            self._err(self.T("purge_big", m=MAX_PURGE))
+            return
+        self._delete_ids(ctx.account, ctx.dialog, list(range(first, top + 1)))
+        self._say(ctx, self.T("purged", n=count), force=False)
+
+    def _cmd_del(self, ctx, arg):
+        if not ctx.reply_id:
+            self._err(self.T("no_reply"))
+            return
+        self._delete_ids(ctx.account, ctx.dialog, [ctx.reply_id])
+
+    def _pin_request(self, ctx: Ctx, msg_id: int, unpin: bool, silent: bool, ok_key: str):
+        mc = self._mc(ctx.account)
+        req = TLRPC.TL_messages_updatePinnedMessage()
+        req.peer = mc.getInputPeer(ctx.dialog)
+        req.id = msg_id
+        req.unpin = unpin
+        req.silent = silent
+
+        def on_reply(res, err):
+            if err is not None:
+                self._err(self._explain(str(getattr(err, "text", err))))
+                return
+            try:
+                mc.processUpdates(res, False)
+            except Exception:
+                pass
+            self._toast(self.T(ok_key))
+        send_request(req, on_reply, account=ctx.account)
+
+    def _cmd_pin(self, ctx, arg):
+        if not self._need(ctx, "pin_messages", group=False):
+            return
+        if not ctx.reply_id:
+            self._err(self.T("no_reply"))
+            return
+        loud = arg.strip().lower() in ("loud", "notify", "violent")
+        self._pin_request(ctx, ctx.reply_id, False, not loud, "pinned")
+
+    def _cmd_unpin(self, ctx, arg):
+        if not self._need(ctx, "pin_messages", group=False):
+            return
+        if arg.strip().lower() == "all" or not ctx.reply_id:
+            mc = self._mc(ctx.account)
+            req = TLRPC.TL_messages_unpinAllMessages()
+            req.peer = mc.getInputPeer(ctx.dialog)
+
+            def on_reply(res, err):
+                if err is not None:
+                    self._err(self._explain(str(getattr(err, "text", err))))
+                else:
+                    self._toast(self.T("unpinned"))
+            send_request(req, on_reply, account=ctx.account)
+            return
+        self._pin_request(ctx, ctx.reply_id, True, True, "unpinned")
+
+    # ----- rules ---------------------------------------------------------------
+
+    def _reply_text(self, ctx: Ctx) -> str:
+        try:
+            return str(ctx.reply.messageOwner.message or "") if ctx.reply is not None else ""
+        except Exception:
+            return ""
+
+    def _cmd_rules(self, ctx, arg):
+        c = self._store.peek(ctx.dialog)
+        rules = (c or {}).get("rules", "")
+        if not rules:
+            self._say(ctx, self.T("rules_none"), force=True)
+        else:
+            self._say(ctx, self.T("rules_head") + "\n\n" + rules, force=True)
+
+    def _cmd_setrules(self, ctx, arg):
+        if not self._need(ctx, "change_info", group=False):
+            return
+        text = (arg.strip() or self._reply_text(ctx).strip())[:LIMITS["rules"]]
+        if not text:
+            self._err(self.T("rules_need"))
+            return
+        with self._store.lock:
+            self._store.chat(ctx.dialog)["rules"] = text
+            self._store.save()
+        self._say(ctx, self.T("rules_set"))
+
+    def _cmd_clearrules(self, ctx, arg):
+        if not self._need(ctx, "change_info", group=False):
+            return
+        with self._store.lock:
+            self._store.chat(ctx.dialog)["rules"] = ""
+            self._store.save()
+        self._say(ctx, self.T("rules_cleared"))
+
+    # ----- admins / report / info / id ---------------------------------------------
+
+    def _fetch_admins(self, ctx: Ctx, cb):
+        """cb(admins: dict uid -> {username, name, bot}, error: str). Cached for 10 minutes."""
+        key = (ctx.account, ctx.dialog)
+        hit = self._admins.get(key)
+        if hit and time.time() - hit[0] < ADMIN_TTL:
+            cb(hit[1], "")
+            return
+        chat = self._chat_obj(ctx)
+        if chat is None or not self._is_channel(chat):
+            cb({}, "supergroups only")
+            return
+        mc = self._mc(ctx.account)
+        try:
+            req = TLRPC.TL_channels_getParticipants()
+            try:
+                req.channel = mc.getInputChannel(-ctx.dialog)
+            except Exception:
+                req.channel = MessagesController.getInputChannel(chat)
+            req.filter = TLRPC.TL_channelParticipantsAdmins()
+            req.offset, req.limit, req.hash = 0, 100, 0
+        except Exception as e:
+            cb({}, str(e))
+            return
+
+        def on_reply(res, err):
+            if err is not None:
+                cb({}, str(getattr(err, "text", err)))
+                return
+            users = {}
+            for u in list(getattr(res, "users", []) or []):
+                users[_to_int(u.id)] = u
+            admins = {}
+            for p in list(getattr(res, "participants", []) or []):
+                uid = _to_int(getattr(p, "user_id", 0))
+                if not uid:
+                    uid = _to_int(getattr(getattr(p, "peer", None), "user_id", 0))
+                u = users.get(uid)
+                if uid and u is not None:
+                    admins[uid] = {"username": str(getattr(u, "username", "") or ""),
+                                   "name": (str(getattr(u, "first_name", "") or "") + " " +
+                                            str(getattr(u, "last_name", "") or "")).strip(),
+                                   "bot": bool(getattr(u, "bot", False))}
+            self._admins[key] = (time.time(), admins)
+            cb(admins, "")
+        send_request(req, on_reply, account=ctx.account)
+
+    def _cmd_admins(self, ctx, arg):
+        if not self._need(ctx):
+            return
+
+        def cb(admins, error):
+            if error:
+                self._err(self.T("admins_fail", e=error))
+                return
+            lines = [self.T("admins_head")]
+            for uid, a in admins.items():
+                lines.append("• " + ("@" + a["username"] if a["username"] else (a["name"] or str(uid)))
+                             + (" 🤖" if a["bot"] else ""))
+            self._say(ctx, "\n".join(lines), force=True)
+        self._fetch_admins(ctx, cb)
+
+    def _cmd_report(self, ctx, arg):
+        if not self._need(ctx):
+            return
+        if not ctx.reply_id or not ctx.reply_uid:
+            self._err(self.T("no_reply"))
+            return
+
+        def cb(admins, error):
+            lines = [self.T("report", r=self._mention(ctx.account, ctx.me),
+                            u=self._mention(ctx.account, ctx.reply_uid))]
+            if arg.strip():
+                lines.append(self.T("report_reason", x=arg.strip()[:300]))
+            pings = ["@" + a["username"] for uid, a in admins.items()
+                     if a["username"] and not a["bot"] and uid != ctx.me][:10]
+            if pings:
+                lines.append(self.T("report_admins", a=" ".join(pings)))
+            self._say(ctx, "\n".join(lines), reply=ctx.reply, force=True)
+        self._fetch_admins(ctx, cb)
+
+    def _cmd_info(self, ctx, arg):
+        uid, _ = self._resolve(ctx, arg)
+        uid = uid or ctx.me
+        user = self._load_user(ctx.account, uid)
+        lines = [self.T("info_head")]
+        lines.append("ID: %d" % uid)
+        if user is not None:
+            full = (str(getattr(user, "first_name", "") or "") + " " + str(getattr(user, "last_name", "") or "")).strip()
+            lines.append("Name: %s" % (full or "-"))
+            uname = str(getattr(user, "username", "") or "")
+            lines.append("Username: %s" % ("@" + uname if uname else "-"))
+            flags = [n for n, a in (("bot", "bot"), ("premium", "premium"), ("verified", "verified"),
+                                    ("scam", "scam"), ("fake", "fake"), ("deleted", "deleted"))
+                     if bool(getattr(user, a, False))]
+            if flags:
+                lines.append("Flags: " + ", ".join(flags))
+        lines.append("Link: tg://user?id=%d" % uid)
+        if ctx.dialog < 0:
+            c = self._store.peek(ctx.dialog)
+            if c:
+                n = len(c["warns"].get(str(uid), []))
+                if n:
+                    lines.append(self.T("info_warns", n=n, l=c["warn"]["limit"]))
+        self._say(ctx, "\n".join(lines), force=True)
+
+    def _cmd_id(self, ctx, arg):
+        lines = [self.T("id_chat", c=ctx.dialog)]
+        uid, _ = self._resolve(ctx, arg)
+        if uid:
+            lines.append(self.T("id_user", u=uid))
+        else:
+            lines.append(self.T("id_user", u=ctx.me))
+        self._say(ctx, "\n".join(lines), force=True)
+
+    # ----- notes ------------------------------------------------------------------
+
+    def _cmd_save(self, ctx, arg):
+        name, text = split_first(arg)
+        name = name.lstrip("#").lower()
+        text = (text or self._reply_text(ctx)).strip()[:LIMITS["note"]]
+        if not NOTE_NAME_RE.match(name) or not text:
+            self._err(self.T("note_usage"))
+            return
+        with self._store.lock:
+            c = self._store.chat(ctx.dialog)
+            if name not in c["notes"] and len(c["notes"]) >= LIMITS["notes"]:
+                self._err(self.T("too_many"))
+                return
+            c["notes"][name] = text
+            self._store.save()
+        self._say(ctx, self.T("note_saved", n=name))
+
+    def _cmd_get(self, ctx, arg):
+        name = split_first(arg)[0].lstrip("#").lower()
+        c = self._store.peek(ctx.dialog)
+        if not name or not c or name not in c["notes"]:
+            self._err(self.T("note_none", n=name or "?"))
+            return
+        self._say(ctx, c["notes"][name], force=True)
+
+    def _cmd_notes(self, ctx, arg):
+        c = self._store.peek(ctx.dialog)
+        if not c or not c["notes"]:
+            self._say(ctx, self.T("notes_empty"), force=True)
+            return
+        self._say(ctx, self.T("notes_head") + "\n" + "\n".join("#" + n for n in sorted(c["notes"])), force=True)
+
+    def _cmd_clear(self, ctx, arg):
+        name = split_first(arg)[0].lstrip("#").lower()
+        with self._store.lock:
+            c = self._store.chat(ctx.dialog)
+            if name not in c["notes"]:
+                self._err(self.T("note_none", n=name or "?"))
+                return
+            del c["notes"][name]
+            self._store.save()
+        self._say(ctx, self.T("note_removed", n=name))
+
+    # ----- filters ----------------------------------------------------------------
+
+    def _cmd_filter(self, ctx, arg):
+        trig, text = split_first(arg)
+        trig = trig.lower()
+        text = (text or self._reply_text(ctx)).strip()[:LIMITS["note"]]
+        if not trig or len(trig) > LIMITS["trigger"] or not text:
+            self._err(self.T("filter_usage"))
+            return
+        with self._store.lock:
+            c = self._store.chat(ctx.dialog)
+            if trig not in c["filters"] and len(c["filters"]) >= LIMITS["filters"]:
+                self._err(self.T("too_many"))
+                return
+            c["filters"][trig] = text
+            self._store.save()
+        self._say(ctx, self.T("filter_saved", t=trig))
+
+    def _cmd_stop(self, ctx, arg):
+        trig = split_first(arg)[0].lower()
+        with self._store.lock:
+            c = self._store.chat(ctx.dialog)
+            if trig not in c["filters"]:
+                self._err(self.T("filter_none"))
+                return
+            del c["filters"][trig]
+            self._store.save()
+        self._say(ctx, self.T("filter_removed", t=trig))
+
+    def _cmd_filters(self, ctx, arg):
+        c = self._store.peek(ctx.dialog)
+        if not c or not c["filters"]:
+            self._say(ctx, self.T("filters_empty"), force=True)
+            return
+        self._say(ctx, self.T("filters_head") + "\n" + "\n".join("• " + t for t in sorted(c["filters"])), force=True)
+
+    def _cmd_adminhelp(self, ctx, arg):
+        self._say(ctx, self.T("adminhelp"), force=True)
+
+    # ----- incoming updates (filters, #notes, newest-id tracking) --------------------
+
+    def on_update_hook(self, update_name, account, update):
+        try:
+            if update_name in ("TL_updateNewMessage", "TL_updateNewChannelMessage"):
+                m = getattr(update, "message", None)
+                if m is None:
+                    return HookResult()
+                dialog = self._peer_dialog(getattr(m, "peer_id", None))
+                self._incoming(account, dialog, self._sender_of(m, dialog), getattr(m, "message", None),
+                               _to_int(getattr(m, "id", 0)), bool(getattr(m, "out", False)))
+        except Exception as e:
+            log("[EmpireAdmin] update hook: %s" % e)
+        return HookResult()
+
+    def on_updates_hook(self, container_name, account, updates):
+        try:
+            out = bool(getattr(updates, "out", False))
+            mid = _to_int(getattr(updates, "id", 0))
+            text = getattr(updates, "message", None)
+            if container_name == "TL_updateShortMessage":
+                uid = _to_int(getattr(updates, "user_id", 0))
+                self._incoming(account, uid, uid, text, mid, out)
+            elif container_name == "TL_updateShortChatMessage":
+                self._incoming(account, -_to_int(getattr(updates, "chat_id", 0)),
+                               _to_int(getattr(updates, "from_id", 0)), text, mid, out)
+        except Exception as e:
+            log("[EmpireAdmin] updates hook: %s" % e)
+        return HookResult()
+
+    @staticmethod
+    def _peer_dialog(peer) -> int:
+        try:
+            if peer is None:
+                return 0
+            if hasattr(peer, "channel_id") and peer.channel_id:
+                return -_to_int(peer.channel_id)
+            if hasattr(peer, "chat_id") and peer.chat_id:
+                return -_to_int(peer.chat_id)
+            if hasattr(peer, "user_id") and peer.user_id:
+                return _to_int(peer.user_id)
+        except Exception:
+            pass
+        return 0
+
+    @staticmethod
+    def _sender_of(msg, dialog: int) -> int:
+        try:
+            frm = getattr(msg, "from_id", None)
+            if frm is not None and hasattr(frm, "user_id") and frm.user_id:
+                return _to_int(frm.user_id)
+        except Exception:
+            pass
+        return dialog if dialog > 0 else 0
+
+    def _incoming(self, account: int, dialog: int, sender: int, text, msg_id: int, out: bool):
+        if not dialog:
+            return
+        if msg_id and dialog < 0:
+            key = (account, dialog)
+            if msg_id > self._top.get(key, 0):
+                self._top[key] = msg_id
+        if out or sender <= 0 or not text:
+            return
+        text = str(text)
+        if len(text) > 500 or not self.get_setting("autoreply", True):
+            return
+        c = self._store.peek(dialog)
+        if not c or not (c["filters"] or c["notes"]):
+            return
+        dedupe = (account, dialog, msg_id)
+        if msg_id:
+            if dedupe in self._seen_set:
+                return
+            if len(self._seen) == self._seen.maxlen:
+                self._seen_set.discard(self._seen[0])
+            self._seen.append(dedupe)
+            self._seen_set.add(dedupe)
+        if sender == self._me(account):
+            return
+        reply = None
+        n = NOTE_RE.match(text.strip())
+        if n and n.group(1).lower() in c["notes"]:
+            reply, trig = c["notes"][n.group(1).lower()], "#" + n.group(1).lower()
+        else:
+            low = text.lower()
+            for trig, body in c["filters"].items():
+                if re.search(r"(?<!\w)" + re.escape(trig) + r"(?!\w)", low):
+                    reply = body
+                    break
+        if reply is None:
+            return
+        now = time.time()
+        ck = (dialog, trig)
+        if now - self._cool.get(ck, 0) < FILTER_COOLDOWN:
+            return
+        self._cool[ck] = now
+        self._submit(self._post, account, dialog, reply)
+
+    # ----- chat export / import ---------------------------------------------------------
+
+    def _cmd_export(self, ctx, arg):
+        words = arg.lower().split()
+        scope_all = "all" in words
+        with self._store.lock:
+            if scope_all:
+                chats = json.loads(json.dumps(self._store.db["chats"]))
+            else:
+                chats = {str(ctx.dialog): json.loads(json.dumps(self._store.chat(ctx.dialog)))}
+        payload = {"format": FORMAT, "version": FORMAT_VERSION, "scope": "all" if scope_all else "chat",
+                   "exported": int(time.time()), "chats": chats}
+        stamp = time.strftime("%Y%m%d_%H%M%S")
+        fname = "empire_admin_%s_%s.json" % ("all" if scope_all else str(abs(ctx.dialog)), stamp)
+        path = os.path.join(tempfile.gettempdir(), fname)
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False, indent=2)
+        here = "here" in words
+        peer = ctx.dialog if here else ctx.me          # private data goes to Saved Messages by default
+        caption = self.T("exported")
+        run_on_ui_thread(lambda: send_document(peer, path, caption=caption, account=ctx.account))
+        self._toast(self.T("export_sent", w=self.T("w_here" if here else "w_saved")))
+        timer = threading.Timer(120, self._remove_file, args=(path,))
+        timer.daemon = True
+        timer.start()
+
+    @staticmethod
+    def _remove_file(path: str):
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+
+    def _read_import(self, ctx: Ctx) -> Optional[dict]:
+        if ctx.reply is None:
+            self._err(self.T("import_need"))
+            return None
+        raw_text = None
+        try:
+            owner = ctx.reply.messageOwner
+            has_doc = getattr(getattr(owner, "media", None), "document", None) is not None
+        except Exception:
+            owner, has_doc = None, False
+        if has_doc:
+            try:
+                f = FileLoader.getInstance(ctx.account).getPathToMessage(owner)
+                if f is None or not f.exists():
+                    self._err(self.T("import_notloaded"))
+                    return None
+                if int(f.length()) > MAX_IMPORT_BYTES:
+                    self._err(self.T("import_bad"))
+                    return None
+                with open(str(f.getAbsolutePath()), "rb") as fh:
+                    raw_text = fh.read().decode("utf-8", "replace")
+            except Exception as e:
+                log("[EmpireAdmin] read import: %s" % e)
+                self._err(self.T("import_notloaded"))
+                return None
+        else:
+            raw_text = self._reply_text(ctx)
+        try:
+            data = json.loads(raw_text or "")
+        except Exception:
+            self._err(self.T("import_bad"))
+            return None
+        if not (isinstance(data, dict) and data.get("format") == FORMAT
+                and data.get("version") == FORMAT_VERSION and isinstance(data.get("chats"), dict)):
+            self._err(self.T("import_bad"))
+            return None
+        return data
+
+    def _cmd_import(self, ctx, arg):
+        words = arg.lower().split()
+        replace = "replace" in words
+        data = self._read_import(ctx)
+        if data is None:
+            return
+        chats = data["chats"]
+        if "all" in words:
+            if not self._need(ctx, group=False):
+                return
+            count = 0
+            with self._store.lock:
+                for cid, block in list(chats.items())[:500]:
+                    clean = sanitize_chat(block)
+                    if clean is not None and re.fullmatch(r"-?\d{1,20}", str(cid)):
+                        self._merge(int(cid), clean, replace)
+                        count += 1
+                self._store.save()
+            self._say(ctx, self.T("import_ok_all", c=count))
+            return
+        if len(chats) != 1:
+            self._err(self.T("import_multi"))
+            return
+        clean = sanitize_chat(next(iter(chats.values())))
+        if clean is None:
+            self._err(self.T("import_bad"))
+            return
+        with self._store.lock:
+            self._merge(ctx.dialog, clean, replace)
+            self._store.save()
+        self._say(ctx, self.T("import_ok", r=1 if clean["rules"] else 0, n=len(clean["notes"]),
+                              f=len(clean["filters"]), w=len(clean["warns"])))
+
+    def _merge(self, dialog: int, clean: dict, replace: bool):
+        c = self._store.chat(dialog)
+        if replace:
+            c["rules"], c["notes"], c["filters"], c["warns"] = "", {}, {}, {}
+        if clean["rules"]:
+            c["rules"] = clean["rules"]
+        c["warn"] = clean["warn"]
+        c["notes"].update(clean["notes"])
+        c["filters"].update(clean["filters"])
+        for uid, rows in clean["warns"].items():
+            c["warns"][uid] = rows
